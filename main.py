@@ -1,8 +1,7 @@
-
+# 导入所需的第三方库
 import torch
 import torchvision
 import torchvision.transforms as transforms
-from mpmath.libmp.libelefun import machin
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
@@ -12,6 +11,9 @@ import copy
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
+
+# 导入项目的模块
+from federated.partition import cifar_iid, cifar_noniid
 
 # step 0）定义一些超参数
 def args_parser():
@@ -37,6 +39,10 @@ def args_parser():
     parser.add_argument('--iid', action='store_true', help='whether i.i.d or not')
     parser.add_argument('--gpu', type=int, default=0, help="GPU ID, -1 for CPU")
     parser.add_argument('--alpha', type=float, default=0.5, help='Dirichlet分布参数，越小越不均匀')
+    # 【新增】FedProx 的核心参数 mu
+    # 当 mu = 0 时，就是标准的 FedAvg
+    # 当 mu > 0 时 (比如 0.01, 0.1, 1), 就是 FedProx
+    parser.add_argument('--mu', type=float, default=0.0, help='FedProx parameter mu (0 for FedAvg)')
     # 3. 开始解析 (读取你在终端敲的命令)
     args = parser.parse_args()
     return args
@@ -82,9 +88,9 @@ test_transform = transforms.Compose([
 ])
 
 # 2. 下载并加载训练集
-# root='./data' 表示把数据下载到当前目录下的 data 文件夹里
+# root='./dataset' 表示把数据下载到当前目录下的 dataset 文件夹里
 trainset = torchvision.datasets.CIFAR10(
-    root='./data',
+    root='./dataset',
     train=True,
     download=True,  # <--- 关键参数：如果没有数据，它会自动下载；如果有，它就跳过
     transform=train_transform
@@ -92,77 +98,13 @@ trainset = torchvision.datasets.CIFAR10(
 
 # 3. 下载并加载测试集，并iid划分用户数据
 testset = torchvision.datasets.CIFAR10(
-    root='./data',
+    root='./dataset',
     train=False,
     download=True,
     transform=test_transform
 )
-
 print("CIFAR10下载/加载完成！")
-def cifar_iid(dataset, num_users):
-    """
-    Sample I.I.D. client data from CIFAR10 dataset
-    :param dataset:
-    :param num_users:
-    :return: dict of image index
-    """
-    num_items = int(len(dataset)/num_users)
-    dict_users, all_idxs = {}, [i for i in range(len(dataset))]
-    for i in range(num_users):
-        dict_users[i] = set(np.random.choice(all_idxs, num_items, replace=False))
-        all_idxs = list(set(all_idxs) - dict_users[i])
-    return dict_users
 
-
-def cifar_noniid(dataset, num_users, alpha=0.5):
-    """
-    使用 Dirichlet 分布生成 Non-IID 数据划分
-    :param dataset: CIFAR10 数据集
-    :param num_users: 客户端数量
-    :param alpha: 控制 Non-IID 程度 (越小越难，0.1极难，0.5常用，100接近IID)
-    :return: dict of image index
-    """
-    num_classes = 10
-    # 获取所有图片的标签 (适配 torchvision 不同版本)
-    if hasattr(dataset, 'targets'):
-        labels = np.array(dataset.targets)
-    elif hasattr(dataset, 'train_labels'):
-        labels = np.array(dataset.train_labels)
-    else:
-        raise ValueError("无法在数据集中找到标签 (targets)")
-
-    # 建立一个字典，记录每个客户端拥有的索引
-    dict_users = {i: np.array([], dtype='int64') for i in range(num_users)}
-
-    # 记录每一类的所有图片索引
-    idxs_classes = [np.where(labels == i)[0] for i in range(num_classes)]
-
-    print(f"开始进行 Dirichlet Non-IID 划分 (Alpha={alpha})...")
-
-    # 对每一类进行分配
-    for c in range(num_classes):
-        idx_k = idxs_classes[c]
-        np.random.shuffle(idx_k)
-
-        # 核心逻辑：利用 Dirichlet 分布生成比例
-        # np.repeat(alpha, num_users) 意思是生成 num_users 个 alpha 参数
-        proportions = np.random.dirichlet(np.repeat(alpha, num_users))
-
-        # 处理比例，防止某个客户端分到 0 张导致报错 (加上一个小极值做平滑，重新归一化)
-        proportions = np.array(
-            [p * (len(idx_j) < len(dataset) / num_users) for p, idx_j in zip(proportions, dict_users.values())])
-        proportions = proportions / proportions.sum()
-        proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
-
-        # 根据切分点分割这一类的索引
-        idx_split = np.split(idx_k, proportions)
-
-        # 把分好的这一类数据塞给对应的客户端
-        for u in range(num_users):
-            dict_users[u] = np.concatenate((dict_users[u], idx_split[u]), axis=0)
-
-    print("Non-IID 划分完成！")
-    return dict_users
 if args.iid:
     dict_users = cifar_iid(trainset, args.num_users)
 else:
@@ -192,7 +134,7 @@ class CNNCifar(nn.Module):
         return x
 # net_glob = CNNCifar(args=args).to(args.device)
 # print('CNNCifar模型样子：\n {}'.format(net_glob))
-def build_model(args):
+def build_resnet18(args):
     # 使用 torchvision 的 ResNet-18
     net = torchvision.models.resnet18(weights=None)  # 不加载预训练权重（本地先跑通/预训练可控）
 
@@ -205,7 +147,7 @@ def build_model(args):
     return net
 
 # 替换原来的 CNNCifar 实例化
-net_glob = build_model(args).to(args.device)
+net_glob = build_resnet18(args).to(args.device)
 # print("ResNet-18 模型样子：\n {}".format(net_glob))
 
 
@@ -250,6 +192,16 @@ class LocalUpdate():
         # train and update
         optimizer = torch.optim.SGD(net.parameters(), lr=self.args.lr, momentum=self.args.momentum)
 
+        # 【FedProx 新增步骤 1】
+        # 在训练开始前，深拷贝一份“全局模型”作为参照物 (Anchor)
+        # 因为 net 刚传进来时就是全局模型，所以直接考一份锁住即可
+        if self.args.mu > 0:
+            global_net = copy.deepcopy(net)
+            global_net.eval()
+            for param in global_net.parameters():
+                param.requires_grad = False  # 锁死参数，不参与梯度计算
+
+
         epoch_loss = []
         for iter in range(self.args.local_ep):
             batch_loss = []
@@ -258,6 +210,19 @@ class LocalUpdate():
                 net.zero_grad()
                 log_probs = net(images)
                 loss = self.loss_func(log_probs, labels)
+
+                # 【FedProx 新增步骤 2】
+                # 如果 mu > 0，计算 Proximal Term 并加到 Loss 上
+                if self.args.mu > 0:
+                    proximal_term = 0.0
+                    # 遍历当前模型 (net) 和 锁死的全局模型 (global_net) 的参数
+                    for w, w_t in zip(net.parameters(), global_net.parameters()):
+                        # 计算 L2 距离的平方: ||w - w_t||^2
+                        proximal_term += (w - w_t).norm(2) ** 2
+
+                    # 修改总 Loss：原始Loss + (mu / 2) * 距离
+                    loss += (self.args.mu / 2) * proximal_term
+
                 loss.backward()
                 optimizer.step()
                 if self.args.verbose and batch_idx % 10 == 0:
@@ -312,7 +277,7 @@ for iter in range(args.epochs):
     loss_locals = []
     w_locals = []
     m = max(int(args.frac * args.num_users), 1)
-    idxs_users = np.random.choice(range(args.num_users), m, replace=False)
+    idxs_users = np.random.choice(range(args.num_users), m, replace=False) # 每轮只训练一部分的客户端
 
     for idx in idxs_users:
         local = LocalUpdate(args=args, dataset=trainset, idxs=dict_users[idx])
